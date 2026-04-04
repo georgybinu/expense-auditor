@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse
 
 from ocr import extract_text_from_image
 from parser import extract_receipt_details
+from pdf import extract_text_from_pdf
 
 app = FastAPI()
 UPLOADS_DIR = Path("uploads")
@@ -44,7 +45,10 @@ def upload_file(file: UploadFile = File(...)) -> str:
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        extracted_text = extract_text_from_image(file_path)
+        if file_path.suffix.lower() == ".pdf":
+            extracted_text = extract_text_from_pdf(file_path)
+        else:
+            extracted_text = extract_text_from_image(file_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
