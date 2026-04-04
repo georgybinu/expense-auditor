@@ -1,112 +1,17 @@
 from pathlib import Path
 from html import escape
-import re
 import shutil
-from typing import Dict, Optional
 
 from fastapi import HTTPException
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse
-from PIL import Image, UnidentifiedImageError
-import pytesseract
+
+from ocr import extract_text_from_image
+from parser import extract_receipt_details
 
 app = FastAPI()
 UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
-
-
-def extract_receipt_details(ocr_text: str) -> Dict[str, Optional[str]]:
-    lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
-    amount_pattern = r"(?:[$€£]\s?)?\d{1,3}(?:,\d{3})*(?:\.\d{2})"
-    merchant_ignore_words = (
-        "receipt",
-        "invoice",
-        "tax",
-        "cashier",
-        "server",
-        "table",
-        "order",
-        "transaction",
-        "approval",
-        "auth",
-        "card",
-        "visa",
-        "mastercard",
-        "subtotal",
-        "total",
-        "amount",
-        "change",
-        "balance",
-        "date",
-        "time",
-        "www",
-        "http",
-    )
-
-    merchant_name = None
-    for line in lines[:8]:
-        normalized_line = line.lower()
-        if re.search(amount_pattern, line):
-            continue
-        if any(word in normalized_line for word in merchant_ignore_words):
-            continue
-        if re.search(r"\d{3,}", line):
-            continue
-        if len(line) < 3:
-            continue
-        merchant_name = line
-        break
-
-    if merchant_name is None and lines:
-        merchant_name = lines[0]
-
-    date_patterns = [
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-        r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
-        r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b",
-        r"\b[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}\b",
-    ]
-    date_match = None
-    for pattern in date_patterns:
-        date_match = re.search(pattern, ocr_text, re.IGNORECASE)
-        if date_match:
-            break
-
-    total_amount = None
-    total_keywords = [
-        "grand total",
-        "amount due",
-        "net total",
-        "total due",
-        "total",
-    ]
-    excluded_total_words = ("subtotal", "tax", "discount", "change", "balance", "tip")
-
-    for line in lines:
-        normalized_line = line.lower()
-        if any(word in normalized_line for word in excluded_total_words):
-            continue
-        if any(keyword in normalized_line for keyword in total_keywords):
-            amounts = re.findall(amount_pattern, line)
-            if amounts:
-                total_amount = amounts[-1].replace(" ", "")
-                break
-
-    if total_amount is None:
-        amount_matches = []
-        for line in lines:
-            normalized_line = line.lower()
-            if any(word in normalized_line for word in ("subtotal", "tax", "discount", "change")):
-                continue
-            amount_matches.extend(re.findall(amount_pattern, line))
-        if amount_matches:
-            total_amount = amount_matches[-1].replace(" ", "")
-
-    return {
-        "merchant_name": merchant_name,
-        "date": date_match.group(0) if date_match else None,
-        "total_amount": total_amount,
-    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -139,15 +44,11 @@ def upload_file(file: UploadFile = File(...)) -> str:
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        with Image.open(file_path) as image:
-            extracted_text = pytesseract.image_to_string(image)
-    except UnidentifiedImageError as exc:
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image") from exc
-    except pytesseract.TesseractNotFoundError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Tesseract OCR is not installed on this system",
-        ) from exc
+        extracted_text = extract_text_from_image(file_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     text = extracted_text.strip() or "No text detected."
     receipt_details = extract_receipt_details(text)
