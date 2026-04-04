@@ -1,5 +1,4 @@
 from pathlib import Path
-from html import escape
 import shutil
 from typing import Optional
 
@@ -10,7 +9,7 @@ from fastapi.responses import HTMLResponse
 from ocr import extract_text_from_image
 from parser import extract_receipt_details
 from pdf import extract_text_from_pdf
-from rules import evaluate_expense
+from rules import evaluate_expense_rule
 
 app = FastAPI()
 UPLOADS_DIR = Path("uploads")
@@ -55,8 +54,8 @@ def read_root() -> str:
     """
 
 
-@app.post("/upload", response_class=HTMLResponse)
-def upload_file(file: UploadFile = File(...)) -> str:
+@app.post("/upload")
+def upload_file(file: UploadFile = File(...)) -> dict:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
 
@@ -79,25 +78,15 @@ def upload_file(file: UploadFile = File(...)) -> str:
     text = extracted_text.strip() or "No text detected."
     receipt_details = extract_receipt_details(text)
     total_value = parse_amount(receipt_details["total_amount"])
-    decision = evaluate_expense(total_value) if total_value is not None else "Unable to evaluate"
+    decision = evaluate_expense_rule(total_value)
 
-    return f"""
-    <html>
-        <head>
-            <title>OCR Result</title>
-        </head>
-        <body>
-            <h1>OCR Result</h1>
-            <p><strong>File:</strong> {escape(safe_name)}</p>
-            <p><strong>Saved to:</strong> {escape(str(file_path))}</p>
-            <h2>Parsed Details</h2>
-            <p><strong>Merchant:</strong> {escape(receipt_details["merchant_name"] or "Not found")}</p>
-            <p><strong>Date:</strong> {escape(receipt_details["date"] or "Not found")}</p>
-            <p><strong>Total:</strong> {escape(receipt_details["total_amount"] or "Not found")}</p>
-            <p><strong>Decision:</strong> {escape(decision)}</p>
-            <h2>Extracted Text</h2>
-            <pre>{escape(text)}</pre>
-            <p><a href="/">Upload another image</a></p>
-        </body>
-    </html>
-    """
+    return {
+        "filename": safe_name,
+        "path": str(file_path),
+        "ocr_text": text,
+        "merchant": receipt_details["merchant_name"],
+        "date": receipt_details["date"],
+        "amount": receipt_details["total_amount"],
+        "status": decision["status"],
+        "reason": decision["reason"],
+    }
