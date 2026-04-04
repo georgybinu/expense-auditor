@@ -1,6 +1,7 @@
 from pathlib import Path
 from html import escape
 import shutil
+from typing import Optional
 
 from fastapi import HTTPException
 from fastapi import FastAPI, File, UploadFile
@@ -9,10 +10,31 @@ from fastapi.responses import HTMLResponse
 from ocr import extract_text_from_image
 from parser import extract_receipt_details
 from pdf import extract_text_from_pdf
+from rules import evaluate_expense
 
 app = FastAPI()
 UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
+
+
+def parse_amount(amount_text: Optional[str]) -> Optional[float]:
+    if not amount_text:
+        return None
+
+    cleaned_amount = (
+        amount_text.replace("$", "")
+        .replace("€", "")
+        .replace("£", "")
+        .replace("Rs.", "")
+        .replace("Rs", "")
+        .replace(",", "")
+        .strip()
+    )
+
+    try:
+        return float(cleaned_amount)
+    except ValueError:
+        return None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -56,6 +78,8 @@ def upload_file(file: UploadFile = File(...)) -> str:
 
     text = extracted_text.strip() or "No text detected."
     receipt_details = extract_receipt_details(text)
+    total_value = parse_amount(receipt_details["total_amount"])
+    decision = evaluate_expense(total_value) if total_value is not None else "Unable to evaluate"
 
     return f"""
     <html>
@@ -70,6 +94,7 @@ def upload_file(file: UploadFile = File(...)) -> str:
             <p><strong>Merchant:</strong> {escape(receipt_details["merchant_name"] or "Not found")}</p>
             <p><strong>Date:</strong> {escape(receipt_details["date"] or "Not found")}</p>
             <p><strong>Total:</strong> {escape(receipt_details["total_amount"] or "Not found")}</p>
+            <p><strong>Decision:</strong> {escape(decision)}</p>
             <h2>Extracted Text</h2>
             <pre>{escape(text)}</pre>
             <p><a href="/">Upload another image</a></p>
