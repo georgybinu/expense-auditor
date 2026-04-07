@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from auth import create_access_token, decode_access_token, hash_password, verify_password
 from database import SessionLocal
-from models import Company, User
+from models import Claim, Company, Policy, User
 from ocr import extract_text_from_image
 from parser import extract_receipt_details
 from pdf import extract_text_from_pdf
@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
+POLICIES_DIR = Path("policies")
+POLICIES_DIR.mkdir(exist_ok=True)
 BLUR_THRESHOLD = 40.0
 POLICY_CHUNKS = []
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -241,6 +243,21 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict:
     }
 
 
+@app.get("/companies")
+def list_companies(db: Session = Depends(get_db)) -> dict:
+    companies = db.query(Company).order_by(Company.name.asc()).all()
+    return {
+        "count": len(companies),
+        "companies": [
+            {
+                "id": company.id,
+                "name": company.name,
+            }
+            for company in companies
+        ],
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def read_root() -> str:
     return """
@@ -310,6 +327,7 @@ def search_policy_chunks(
 def upload_policy(
     file: UploadFile = File(...),
     current_user: User = Depends(require_auditor),
+    db: Session = Depends(get_db),
 ) -> dict:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
@@ -317,8 +335,11 @@ def upload_policy(
     if Path(file.filename).suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Policy upload must be a PDF")
 
+    if current_user.company_id is None:
+        raise HTTPException(status_code=400, detail="Auditor is not linked to a company")
+
     safe_name = Path(file.filename).name
-    file_path = UPLOADS_DIR / safe_name
+    file_path = POLICIES_DIR / safe_name
 
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -333,6 +354,14 @@ def upload_policy(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    policy = Policy(
+        company_id=current_user.company_id,
+        file_path=str(file_path),
+    )
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+
     logger.info("Processed policy upload file=%s chunks=%s", safe_name, len(policy_chunks))
 
     return {
@@ -342,11 +371,69 @@ def upload_policy(
             "id": current_user.id,
             "email": current_user.email,
             "role": current_user.role,
+            "company_id": current_user.company_id,
         },
         "policy": {
+            "id": policy.id,
+            "company_id": policy.company_id,
             "path": str(file_path),
             "chunk_count": len(policy_chunks),
-            "chunks": policy_chunks,
+        },
+    }
+
+
+@app.post("/claims")
+def submit_claim(
+    justification: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_employee),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected")
+
+    if current_user.company_id is None:
+        raise HTTPException(status_code=400, detail="Employee is not linked to a company")
+
+    if Path(file.filename).suffix.lower() == ".pdf":
+        raise HTTPException(status_code=400, detail="Claim submission requires a receipt image, not a PDF")
+
+    safe_name = Path(file.filename).name
+    file_path = UPLOADS_DIR / safe_name
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        extracted_text = extract_text_from_image(file_path).strip()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    claim = Claim(
+        user_id=current_user.id,
+        company_id=current_user.company_id,
+        status="Pending",
+        reason="Pending review",
+        receipt_path=str(file_path),
+        justification=justification,
+    )
+    db.add(claim)
+    db.commit()
+    db.refresh(claim)
+
+    return {
+        "message": "Claim submitted successfully",
+        "claim": {
+            "id": claim.id,
+            "user_id": claim.user_id,
+            "company_id": claim.company_id,
+            "status": claim.status,
+            "justification": claim.justification,
+            "receipt_path": claim.receipt_path,
+            "extracted_text": extracted_text,
+            "created_at": claim.created_at,
         },
     }
 
