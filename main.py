@@ -46,6 +46,55 @@ def parse_amount(amount_text: Optional[str]) -> Optional[float]:
         return None
 
 
+def choose_final_decision(rule_decision: dict, llm_decision: dict) -> dict:
+    if llm_decision["status"] and llm_decision["reason"]:
+        return {
+            "status": llm_decision["status"],
+            "reason": llm_decision["reason"],
+            "confidence": llm_decision["confidence"],
+            "source": "llm",
+        }
+
+    return {
+        "status": rule_decision["status"],
+        "reason": rule_decision["reason"],
+        "confidence": None,
+        "source": "rule_engine",
+    }
+
+
+def get_status_color(status: str) -> str:
+    status_colors = {
+        "Approved": "Green",
+        "Flagged": "Yellow",
+        "Rejected": "Red",
+    }
+    return status_colors.get(status, "Yellow")
+
+
+def validate_receipt_data(
+    receipt_details: dict,
+    blur_score: Optional[float],
+) -> list:
+    validation_errors = []
+
+    if blur_score is not None and blur_score < BLUR_THRESHOLD:
+        validation_errors.append(
+            f"Uploaded image is too blurry for reliable OCR (blur score: {blur_score:.2f})"
+        )
+
+    required_fields = {
+        "merchant_name": "merchant",
+        "total_amount": "amount",
+        "date": "date",
+    }
+    for field_key, field_name in required_fields.items():
+        if not receipt_details.get(field_key):
+            validation_errors.append(f"Missing required receipt data: {field_name}")
+
+    return validation_errors
+
+
 @app.get("/", response_class=HTMLResponse)
 def read_root() -> str:
     return """
@@ -113,44 +162,46 @@ def upload_file(
     safe_name = Path(file.filename).name
     file_path = UPLOADS_DIR / safe_name
     blur_score = None
-    text_chunks = None
 
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     try:
+        # 1. Check blur for uploaded images.
         if file_path.suffix.lower() == ".pdf":
             extracted_text = extract_text_from_pdf(file_path)
-            text_chunks = chunk_text(extracted_text, 300)
+            policy_chunks = chunk_text(extracted_text, 300)
             POLICY_CHUNKS.clear()
-            POLICY_CHUNKS.extend(text_chunks)
+            POLICY_CHUNKS.extend(policy_chunks)
         else:
+            policy_chunks = None
             try:
                 blur_score = get_blur_score(file_path)
             except RuntimeError:
                 logger.warning("OpenCV not installed; skipping blur check for file=%s", safe_name)
-            else:
-                if blur_score < BLUR_THRESHOLD:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Uploaded image is too blurry for OCR (blur score: {blur_score:.2f})",
-                    )
+
+            # 2. Extract OCR from the image.
             extracted_text = extract_text_from_image(file_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    # 3. Parse receipt data from the extracted text.
     text = extracted_text.strip() or "No text detected."
     receipt_details = extract_receipt_details(text)
     total_value = parse_amount(receipt_details["total_amount"])
-    decision = evaluate_expense_rule(total_value)
+    validation_errors = validate_receipt_data(receipt_details, blur_score)
+
+    # 4. Retrieve relevant policy chunks.
     relevant_policy_chunks = retrieve_relevant_chunks(
         chunks=POLICY_CHUNKS,
         expense_category=justification,
         city=city,
         employee_role=employee_role,
     )
+
+    # 5. Build the LLM prompt.
     policy_text = "\n\n".join(relevant_policy_chunks) if relevant_policy_chunks else "No relevant policy text found."
     auditor_prompt = build_auditor_prompt(
         receipt_data=receipt_details,
@@ -159,24 +210,25 @@ def upload_file(
         city=city,
         role=employee_role,
     )
+
+    # 6. Call llama3 and parse its JSON response.
     try:
         llm_response = query_llama3(auditor_prompt)
     except Exception as exc:
         logger.warning("Failed to query llama3 for file=%s: %s", safe_name, exc)
         llm_response = f"LLM call failed: {exc}"
+
     llm_decision = extract_llm_json(llm_response)
-    final_decision = {
-        "status": decision["status"],
-        "explanation": decision["reason"],
-        "confidence": None,
-        "source": "rule_engine",
-    }
-    if llm_decision["status"] and llm_decision["reason"]:
+    rule_decision = evaluate_expense_rule(total_value)
+
+    # 7. Return the final decision JSON.
+    final_decision = choose_final_decision(rule_decision, llm_decision)
+    if validation_errors:
         final_decision = {
-            "status": llm_decision["status"],
-            "explanation": llm_decision["reason"],
-            "confidence": llm_decision["confidence"],
-            "source": "llm",
+            "status": "Rejected",
+            "reason": "; ".join(validation_errors),
+            "confidence": "1.0",
+            "source": "validation",
         }
     logger.info(
         "Processed upload file=%s extracted_amount=%s",
@@ -185,32 +237,38 @@ def upload_file(
     )
 
     return {
-        "filename": safe_name,
-        "submitted_data": {
-            "justification": justification,
-            "city": city,
-            "employee_role": employee_role,
-            "claimed_date": claimed_date,
-        },
-        "extracted_data": {
-            "path": str(file_path),
-            "blur_score": blur_score,
-            "ocr_text": text,
-            "text_chunks": text_chunks,
+        "status": final_decision["status"],
+        "color": get_status_color(final_decision["status"]),
+        "reason": final_decision["reason"],
+        "confidence": final_decision["confidence"],
+        "source": final_decision["source"],
+        "receipt": {
+            "filename": safe_name,
             "merchant": receipt_details["merchant_name"],
-            "date": receipt_details["date"],
             "amount": receipt_details["total_amount"],
+            "date": receipt_details["date"],
+            "claimed_date": claimed_date,
+            "blur_score": blur_score,
         },
-        "decision": final_decision,
-        "rule_decision": {
-            "status": decision["status"],
-            "explanation": decision["reason"],
+        "employee": {
+            "city": city,
+            "role": employee_role,
+            "justification": justification,
         },
-        "policy_match": {
-            "count": len(relevant_policy_chunks),
-            "chunks": relevant_policy_chunks,
+        "policy": {
+            "matched_chunks": relevant_policy_chunks,
+            "matched_count": len(relevant_policy_chunks),
         },
-        "auditor_prompt": auditor_prompt,
-        "llm_response": llm_response,
-        "llm_decision": llm_decision,
+        "validation": {
+            "passed": not validation_errors,
+            "errors": validation_errors,
+        },
+        "debug": {
+            "path": str(file_path),
+            "ocr_text": text,
+            "policy_chunks_stored": len(POLICY_CHUNKS),
+            "auditor_prompt": auditor_prompt,
+            "llm_response": llm_response,
+            "rule_decision": rule_decision,
+        },
     }
