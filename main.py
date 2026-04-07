@@ -12,6 +12,7 @@ from parser import extract_receipt_details
 from pdf import extract_text_from_pdf
 from quality import get_blur_score
 from rules import evaluate_expense_rule
+from text_utils import chunk_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ def upload_file(
     safe_name = Path(file.filename).name
     file_path = UPLOADS_DIR / safe_name
     blur_score = None
+    text_chunks = None
 
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -85,6 +87,7 @@ def upload_file(
     try:
         if file_path.suffix.lower() == ".pdf":
             extracted_text = extract_text_from_pdf(file_path)
+            text_chunks = chunk_text(extracted_text, 300)
         else:
             try:
                 blur_score = get_blur_score(file_path)
@@ -124,6 +127,7 @@ def upload_file(
             "path": str(file_path),
             "blur_score": blur_score,
             "ocr_text": text,
+            "text_chunks": text_chunks,
             "merchant": receipt_details["merchant_name"],
             "date": receipt_details["date"],
             "amount": receipt_details["total_amount"],
