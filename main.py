@@ -5,11 +5,12 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException
 from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from auth import create_access_token, hash_password, verify_password
+from auth import create_access_token, decode_access_token, hash_password, verify_password
 from database import SessionLocal
 from models import Company, User
 from ocr import extract_text_from_image
@@ -29,6 +30,7 @@ UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
 BLUR_THRESHOLD = 40.0
 POLICY_CHUNKS = []
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
 class SignupRequest(BaseModel):
@@ -49,6 +51,43 @@ def get_db() -> Session:
         yield db
     finally:
         db.close()
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = decode_access_token(token)
+        email = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except Exception:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
+def require_auditor(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "auditor":
+        raise HTTPException(status_code=403, detail="Auditor access required")
+    return current_user
+
+
+def require_employee(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "employee":
+        raise HTTPException(status_code=403, detail="Employee access required")
+    return current_user
 
 
 def parse_amount(amount_text: Optional[str]) -> Optional[float]:
@@ -225,8 +264,14 @@ def read_root() -> str:
 
 
 @app.get("/policy-chunks")
-def get_policy_chunks() -> dict:
+def get_policy_chunks(current_user: User = Depends(require_auditor)) -> dict:
     return {
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "role": current_user.role,
+            "company_id": current_user.company_id,
+        },
         "count": len(POLICY_CHUNKS),
         "chunks": POLICY_CHUNKS,
     }
@@ -237,6 +282,7 @@ def search_policy_chunks(
     expense_category: Optional[str] = None,
     city: Optional[str] = None,
     employee_role: Optional[str] = None,
+    current_user: User = Depends(require_auditor),
 ) -> dict:
     relevant_chunks = retrieve_relevant_chunks(
         chunks=POLICY_CHUNKS,
@@ -250,8 +296,58 @@ def search_policy_chunks(
             "city": city,
             "employee_role": employee_role,
         },
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "role": current_user.role,
+        },
         "count": len(relevant_chunks),
         "chunks": relevant_chunks,
+    }
+
+
+@app.post("/policy-upload")
+def upload_policy(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_auditor),
+) -> dict:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected")
+
+    if Path(file.filename).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Policy upload must be a PDF")
+
+    safe_name = Path(file.filename).name
+    file_path = UPLOADS_DIR / safe_name
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        extracted_text = extract_text_from_pdf(file_path)
+        policy_chunks = chunk_text(extracted_text, 300)
+        POLICY_CHUNKS.clear()
+        POLICY_CHUNKS.extend(policy_chunks)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    logger.info("Processed policy upload file=%s chunks=%s", safe_name, len(policy_chunks))
+
+    return {
+        "message": "Policy uploaded successfully",
+        "filename": safe_name,
+        "uploaded_by": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "role": current_user.role,
+        },
+        "policy": {
+            "path": str(file_path),
+            "chunk_count": len(policy_chunks),
+            "chunks": policy_chunks,
+        },
     }
 
 
@@ -262,9 +358,13 @@ def upload_file(
     employee_role: str = Form(...),
     claimed_date: str = Form(...),
     file: UploadFile = File(...),
+    current_user: User = Depends(require_employee),
 ) -> dict:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
+
+    if Path(file.filename).suffix.lower() == ".pdf":
+        raise HTTPException(status_code=400, detail="Claim submission does not accept PDF policy uploads")
 
     safe_name = Path(file.filename).name
     file_path = UPLOADS_DIR / safe_name
@@ -275,20 +375,13 @@ def upload_file(
 
     try:
         # 1. Check blur for uploaded images.
-        if file_path.suffix.lower() == ".pdf":
-            extracted_text = extract_text_from_pdf(file_path)
-            policy_chunks = chunk_text(extracted_text, 300)
-            POLICY_CHUNKS.clear()
-            POLICY_CHUNKS.extend(policy_chunks)
-        else:
-            policy_chunks = None
-            try:
-                blur_score = get_blur_score(file_path)
-            except RuntimeError:
-                logger.warning("OpenCV not installed; skipping blur check for file=%s", safe_name)
+        try:
+            blur_score = get_blur_score(file_path)
+        except RuntimeError:
+            logger.warning("OpenCV not installed; skipping blur check for file=%s", safe_name)
 
-            # 2. Extract OCR from the image.
-            extracted_text = extract_text_from_image(file_path)
+        # 2. Extract OCR from the image.
+        extracted_text = extract_text_from_image(file_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -358,6 +451,8 @@ def upload_file(
             "blur_score": blur_score,
         },
         "employee": {
+            "id": current_user.id,
+            "email": current_user.email,
             "city": city,
             "role": employee_role,
             "justification": justification,
