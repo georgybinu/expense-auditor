@@ -1,6 +1,8 @@
 import math
 from typing import List, Tuple
 
+import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 
@@ -46,3 +48,33 @@ def semantic_search_chunks(
 
     scored_chunks.sort(key=lambda item: item[1], reverse=True)
     return scored_chunks[:max_results]
+
+
+def build_faiss_index(embeddings: List[List[float]]) -> faiss.IndexFlatL2:
+    if not embeddings:
+        raise ValueError("Embeddings list cannot be empty")
+
+    embedding_array = np.array(embeddings, dtype="float32")
+    index = faiss.IndexFlatL2(embedding_array.shape[1])
+    index.add(embedding_array)
+    return index
+
+
+def search_faiss_index(
+    query: str,
+    index: faiss.Index,
+    chunks: List[str],
+    top_k: int = 2,
+) -> List[str]:
+    if not query.strip() or not chunks:
+        return []
+
+    query_embedding = model.encode([query], convert_to_numpy=True).astype("float32")
+    _, indices = index.search(query_embedding, top_k)
+
+    results = []
+    for chunk_index in indices[0]:
+        if 0 <= chunk_index < len(chunks):
+            results.append(chunks[chunk_index])
+
+    return results

@@ -14,6 +14,10 @@ def build_auditor_prompt(
 
     return f"""You are an expense auditor.
 
+Use only the retrieved policy chunks provided below to make your decision.
+Do not rely on outside assumptions, general knowledge, or unstated company rules.
+If the retrieved policy chunks do not contain enough information, return "Flagged" and explain that the policy evidence is insufficient.
+
 Receipt:
 Merchant: {merchant}
 Amount: {amount}
@@ -26,13 +30,13 @@ Role: {role}
 Justification:
 {justification}
 
-Policy:
+Retrieved Policy Chunks:
 {policy_text}
 
 Tasks:
-1. Check policy violations
-2. Check justification validity
-3. Return decision
+1. Check whether the receipt and justification violate the retrieved policy chunks
+2. Check whether the justification is supported by the retrieved policy chunks
+3. Return a decision based strictly on the retrieved policy chunks
 
 Output JSON:
 {{

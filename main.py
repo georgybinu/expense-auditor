@@ -18,7 +18,7 @@ from parser import extract_receipt_details
 from pdf import extract_text_from_pdf
 from prompt_utils import build_auditor_prompt
 from quality import get_blur_score
-from rag_utils import generate_embeddings, semantic_search_chunks
+from rag_utils import build_faiss_index, generate_embeddings, search_faiss_index, semantic_search_chunks
 from rules import evaluate_expense_rule
 from text_utils import chunk_text, retrieve_relevant_chunks
 from llm import extract_llm_json, query_llama3
@@ -34,6 +34,7 @@ POLICIES_DIR.mkdir(exist_ok=True)
 BLUR_THRESHOLD = 40.0
 POLICY_CHUNKS = []
 POLICY_CHUNK_EMBEDDINGS = []
+POLICY_FAISS_INDEX = None
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
@@ -498,6 +499,8 @@ def upload_policy(
     current_user: User = Depends(require_auditor),
     db: Session = Depends(get_db),
 ) -> dict:
+    global POLICY_FAISS_INDEX
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
 
@@ -515,12 +518,13 @@ def upload_policy(
 
     try:
         extracted_text = extract_text_from_pdf(file_path)
-        policy_chunks = chunk_text(extracted_text, 300)
+        policy_chunks = chunk_text(extracted_text)
         policy_embeddings = generate_embeddings(policy_chunks) if policy_chunks else []
         POLICY_CHUNKS.clear()
         POLICY_CHUNKS.extend(policy_chunks)
         POLICY_CHUNK_EMBEDDINGS.clear()
         POLICY_CHUNK_EMBEDDINGS.extend(policy_embeddings)
+        POLICY_FAISS_INDEX = build_faiss_index(policy_embeddings) if policy_embeddings else None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -562,6 +566,8 @@ def submit_claim(
     current_user: User = Depends(require_employee),
     db: Session = Depends(get_db),
 ) -> dict:
+    global POLICY_FAISS_INDEX
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
 
@@ -601,11 +607,35 @@ def submit_claim(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    relevant_policy_chunks = retrieve_relevant_chunks(
-        chunks=chunk_text(policy_text, 300),
+    policy_chunks = chunk_text(policy_text)
+    policy_embeddings = POLICY_CHUNK_EMBEDDINGS
+    if not policy_embeddings or len(policy_embeddings) != len(policy_chunks):
+        policy_embeddings = generate_embeddings(policy_chunks) if policy_chunks else []
+
+    if policy_embeddings:
+        POLICY_FAISS_INDEX = build_faiss_index(policy_embeddings)
+
+    query_parts = [
+        receipt_details.get("merchant_name"),
+        receipt_details.get("total_amount"),
+        receipt_details.get("date"),
+        justification,
+        current_user.city,
+        current_user.designation or current_user.role,
+    ]
+    policy_query = " ".join(part.strip() for part in query_parts if part and str(part).strip())
+
+    relevant_policy_chunks = search_faiss_index(
+        query=policy_query,
+        index=POLICY_FAISS_INDEX,
+        chunks=policy_chunks,
+        top_k=2,
+    ) if POLICY_FAISS_INDEX is not None else retrieve_relevant_chunks(
+        chunks=policy_chunks,
         expense_category=justification,
         city=current_user.city,
         employee_role=current_user.designation or current_user.role,
+        max_results=2,
     )
     policy_snippet = "\n\n".join(relevant_policy_chunks) if relevant_policy_chunks else policy_text
 
