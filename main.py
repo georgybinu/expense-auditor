@@ -53,6 +53,9 @@ def read_root() -> str:
             <h1>Upload File</h1>
             <form action="/upload" enctype="multipart/form-data" method="post">
                 <input name="justification" type="text" placeholder="Enter justification" />
+                <input name="city" type="text" placeholder="Enter city" />
+                <input name="employee_role" type="text" placeholder="Enter employee role" />
+                <input name="claimed_date" type="text" placeholder="Enter claimed date" />
                 <input name="file" type="file" />
                 <button type="submit">Upload</button>
             </form>
@@ -64,6 +67,9 @@ def read_root() -> str:
 @app.post("/upload")
 def upload_file(
     justification: str = Form(...),
+    city: str = Form(...),
+    employee_role: str = Form(...),
+    claimed_date: str = Form(...),
     file: UploadFile = File(...),
 ) -> dict:
     if not file.filename:
@@ -108,7 +114,12 @@ def upload_file(
 
     return {
         "filename": safe_name,
-        "justification": justification,
+        "submitted_data": {
+            "justification": justification,
+            "city": city,
+            "employee_role": employee_role,
+            "claimed_date": claimed_date,
+        },
         "extracted_data": {
             "path": str(file_path),
             "blur_score": blur_score,
