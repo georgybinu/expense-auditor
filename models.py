@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from database import Base
@@ -53,6 +53,8 @@ class Claim(Base):
     reason = Column(String)
     receipt_path = Column(String)
     justification = Column(String)
+    extracted_text = Column(Text)
+    policy_snippet = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="claims")

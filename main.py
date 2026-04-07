@@ -94,6 +94,24 @@ def require_employee(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def get_accessible_claim(
+    claim_id: int,
+    current_user: User,
+    db: Session,
+) -> Claim:
+    claim = db.query(Claim).filter(Claim.id == claim_id).first()
+    if claim is None:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    if current_user.role == "auditor" and current_user.company_id == claim.company_id:
+        return claim
+
+    if current_user.role == "employee" and current_user.id == claim.user_id:
+        return claim
+
+    raise HTTPException(status_code=403, detail="Not authorized to access this claim")
+
+
 def parse_amount(amount_text: Optional[str]) -> Optional[float]:
     if not amount_text:
         return None
@@ -138,6 +156,24 @@ def get_status_color(status: str) -> str:
         "Rejected": "Red",
     }
     return status_colors.get(status, "Yellow")
+
+
+def get_notification_message(status: Optional[str]) -> str:
+    notifications = {
+        "Approved": "Approved",
+        "Flagged": "Needs review",
+        "Rejected": "Rejected",
+    }
+    return notifications.get(status or "", "Needs review")
+
+
+def get_risk_priority(status: Optional[str]) -> int:
+    priorities = {
+        "Rejected": 0,
+        "Flagged": 1,
+        "Approved": 2,
+    }
+    return priorities.get(status or "", 3)
 
 
 def validate_receipt_data(
@@ -343,16 +379,18 @@ def list_company_claims(
     if current_user.company_id is None:
         raise HTTPException(status_code=400, detail="Auditor is not linked to a company")
 
-    claims = (
-        db.query(Claim)
-        .filter(Claim.company_id == current_user.company_id)
-        .order_by(Claim.created_at.desc())
-        .all()
+    claims = db.query(Claim).filter(Claim.company_id == current_user.company_id).all()
+    claims.sort(
+        key=lambda claim: (
+            get_risk_priority(claim.status),
+            -(claim.created_at.timestamp() if claim.created_at else 0),
+        )
     )
 
     return {
         "company_id": current_user.company_id,
         "count": len(claims),
+        "sort_order": ["Rejected", "Flagged", "Approved"],
         "claims": [
             {
                 "id": claim.id,
@@ -360,8 +398,69 @@ def list_company_claims(
                 "company_id": claim.company_id,
                 "amount": claim.amount,
                 "status": claim.status,
+                "color": get_status_color(claim.status),
+                "message": get_notification_message(claim.status),
                 "reason": claim.reason,
                 "receipt_path": claim.receipt_path,
+                "justification": claim.justification,
+                "created_at": claim.created_at,
+            }
+            for claim in claims
+        ],
+    }
+
+
+@app.get("/claims/{claim_id}")
+def get_claim_details(
+    claim_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    claim = get_accessible_claim(claim_id, current_user, db)
+
+    return {
+        "claim": {
+            "id": claim.id,
+            "user_id": claim.user_id,
+            "company_id": claim.company_id,
+            "receipt_path": claim.receipt_path,
+            "extracted_text": claim.extracted_text,
+            "justification": claim.justification,
+            "ai_decision": claim.status,
+            "color": get_status_color(claim.status),
+            "message": get_notification_message(claim.status),
+            "reason": claim.reason,
+            "policy_snippet": claim.policy_snippet,
+            "created_at": claim.created_at,
+        }
+    }
+
+
+@app.get("/my-claims")
+def list_my_claims(
+    current_user: User = Depends(require_employee),
+    db: Session = Depends(get_db),
+) -> dict:
+    claims = (
+        db.query(Claim)
+        .filter(Claim.user_id == current_user.id)
+        .order_by(Claim.created_at.desc())
+        .all()
+    )
+
+    return {
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+        },
+        "count": len(claims),
+        "claims": [
+            {
+                "id": claim.id,
+                "status": claim.status,
+                "color": get_status_color(claim.status),
+                "message": get_notification_message(claim.status),
+                "reason": claim.reason,
                 "justification": claim.justification,
                 "created_at": claim.created_at,
             }
@@ -475,10 +574,18 @@ def submit_claim(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    relevant_policy_chunks = retrieve_relevant_chunks(
+        chunks=chunk_text(policy_text, 300),
+        expense_category=justification,
+        city=current_user.city,
+        employee_role=current_user.designation or current_user.role,
+    )
+    policy_snippet = "\n\n".join(relevant_policy_chunks) if relevant_policy_chunks else policy_text
+
     auditor_prompt = build_auditor_prompt(
         receipt_data=receipt_details,
         justification=justification,
-        policy_text=policy_text,
+        policy_text=policy_snippet,
         city=current_user.city or "Unknown",
         role=current_user.designation or current_user.role,
     )
@@ -502,6 +609,8 @@ def submit_claim(
         reason=claim_reason,
         receipt_path=str(file_path),
         justification=justification,
+        extracted_text=extracted_text,
+        policy_snippet=policy_snippet,
     )
     db.add(claim)
     db.commit()
@@ -515,11 +624,14 @@ def submit_claim(
             "company_id": claim.company_id,
             "amount": claim.amount,
             "status": claim.status,
+            "color": get_status_color(claim.status),
+            "message": get_notification_message(claim.status),
             "reason": claim.reason,
             "justification": claim.justification,
             "receipt_path": claim.receipt_path,
             "extracted_text": extracted_text,
             "policy_path": latest_policy.file_path,
+            "policy_snippet": policy_snippet,
             "llm_decision": llm_decision,
             "created_at": claim.created_at,
         },
