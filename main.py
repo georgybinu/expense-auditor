@@ -18,6 +18,7 @@ from parser import extract_receipt_details
 from pdf import extract_text_from_pdf
 from prompt_utils import build_auditor_prompt
 from quality import get_blur_score
+from rag_utils import generate_embeddings, semantic_search_chunks
 from rules import evaluate_expense_rule
 from text_utils import chunk_text, retrieve_relevant_chunks
 from llm import extract_llm_json, query_llama3
@@ -32,6 +33,7 @@ POLICIES_DIR = Path("policies")
 POLICIES_DIR.mkdir(exist_ok=True)
 BLUR_THRESHOLD = 40.0
 POLICY_CHUNKS = []
+POLICY_CHUNK_EMBEDDINGS = []
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
@@ -338,6 +340,7 @@ def get_policy_chunks(current_user: User = Depends(require_auditor)) -> dict:
             "company_id": current_user.company_id,
         },
         "count": len(POLICY_CHUNKS),
+        "embedding_count": len(POLICY_CHUNK_EMBEDDINGS),
         "chunks": POLICY_CHUNKS,
     }
 
@@ -349,12 +352,24 @@ def search_policy_chunks(
     employee_role: Optional[str] = None,
     current_user: User = Depends(require_auditor),
 ) -> dict:
-    relevant_chunks = retrieve_relevant_chunks(
+    query_parts = [expense_category, city, employee_role]
+    semantic_query = " ".join(part.strip() for part in query_parts if part and part.strip())
+    semantic_results = semantic_search_chunks(
+        query=semantic_query,
         chunks=POLICY_CHUNKS,
-        expense_category=expense_category,
-        city=city,
-        employee_role=employee_role,
+        embeddings=POLICY_CHUNK_EMBEDDINGS,
     )
+
+    if semantic_results:
+        relevant_chunks = [chunk for chunk, _ in semantic_results]
+    else:
+        relevant_chunks = retrieve_relevant_chunks(
+            chunks=POLICY_CHUNKS,
+            expense_category=expense_category,
+            city=city,
+            employee_role=employee_role,
+        )
+
     return {
         "query": {
             "expense_category": expense_category,
@@ -366,7 +381,15 @@ def search_policy_chunks(
             "email": current_user.email,
             "role": current_user.role,
         },
+        "search_type": "semantic" if semantic_results else "keyword",
         "count": len(relevant_chunks),
+        "matches": [
+            {
+                "chunk": chunk,
+                "score": score,
+            }
+            for chunk, score in semantic_results
+        ] if semantic_results else [],
         "chunks": relevant_chunks,
     }
 
@@ -493,8 +516,11 @@ def upload_policy(
     try:
         extracted_text = extract_text_from_pdf(file_path)
         policy_chunks = chunk_text(extracted_text, 300)
+        policy_embeddings = generate_embeddings(policy_chunks) if policy_chunks else []
         POLICY_CHUNKS.clear()
         POLICY_CHUNKS.extend(policy_chunks)
+        POLICY_CHUNK_EMBEDDINGS.clear()
+        POLICY_CHUNK_EMBEDDINGS.extend(policy_embeddings)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -524,6 +550,7 @@ def upload_policy(
             "company_id": policy.company_id,
             "path": str(file_path),
             "chunk_count": len(policy_chunks),
+            "embedding_count": len(POLICY_CHUNK_EMBEDDINGS),
         },
     }
 

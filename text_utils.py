@@ -1,13 +1,21 @@
 from typing import List, Optional
 
 
-def chunk_text(text: str, chunk_size: int = 300) -> List[str]:
+def chunk_text(text: str, min_words: int = 200, max_words: int = 300) -> List[str]:
     words = text.split()
     chunks = []
+    index = 0
 
-    for index in range(0, len(words), chunk_size):
+    while index < len(words):
+        remaining = len(words) - index
+        chunk_size = max_words if remaining > max_words else remaining
+
+        if remaining > max_words and remaining - max_words < min_words:
+            chunk_size = remaining // 2
+
         chunk = words[index:index + chunk_size]
         chunks.append(" ".join(chunk))
+        index += chunk_size
 
     return chunks
 
