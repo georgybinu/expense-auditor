@@ -3,10 +3,15 @@ import logging
 import shutil
 from typing import Optional
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from auth import create_access_token, hash_password, verify_password
+from database import SessionLocal
+from models import Company, User
 from ocr import extract_text_from_image
 from parser import extract_receipt_details
 from pdf import extract_text_from_pdf
@@ -24,6 +29,26 @@ UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
 BLUR_THRESHOLD = 40.0
 POLICY_CHUNKS = []
+
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    role: str
+    company_name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def parse_amount(amount_text: Optional[str]) -> Optional[float]:
@@ -93,6 +118,88 @@ def validate_receipt_data(
             validation_errors.append(f"Missing required receipt data: {field_name}")
 
     return validation_errors
+
+
+@app.post("/signup")
+def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> dict:
+    role = payload.role.strip().lower()
+    if role not in {"auditor", "employee"}:
+        raise HTTPException(status_code=400, detail="Role must be either 'auditor' or 'employee'")
+
+    existing_user = db.query(User).filter(User.email == payload.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email is already registered")
+
+    company = None
+    company_name = payload.company_name.strip() if payload.company_name else None
+
+    if role == "auditor":
+        if not company_name:
+            raise HTTPException(status_code=400, detail="company_name is required for auditors")
+
+        existing_company = db.query(Company).filter(Company.name == company_name).first()
+        if existing_company:
+            raise HTTPException(status_code=400, detail="Company already exists")
+
+        company = Company(name=company_name)
+        db.add(company)
+        db.flush()
+
+    if role == "employee":
+        if not company_name:
+            raise HTTPException(status_code=400, detail="company_name is required for employees")
+
+        company = db.query(Company).filter(Company.name == company_name).first()
+        if company is None:
+            raise HTTPException(status_code=404, detail="Company not found")
+
+    user = User(
+        email=payload.email,
+        password=hash_password(payload.password),
+        role=role,
+        company_id=company.id if company else None,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "message": "User created successfully",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "company_id": user.company_id,
+            "company_name": company.name if company else None,
+        },
+    }
+
+
+@app.post("/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict:
+    user = db.query(User).filter(User.email == payload.email).first()
+    if user is None or not verify_password(payload.password, user.password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    access_token = create_access_token(
+        data={
+            "sub": user.email,
+            "role": user.role,
+            "company_id": user.company_id,
+        }
+    )
+
+    return {
+        "message": "Login successful",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "company_id": user.company_id,
+        },
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
