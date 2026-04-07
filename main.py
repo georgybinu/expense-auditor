@@ -40,6 +40,8 @@ class SignupRequest(BaseModel):
     password: str
     role: str
     company_name: Optional[str] = None
+    city: Optional[str] = None
+    designation: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -189,6 +191,10 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> dict:
     if role == "employee":
         if not company_name:
             raise HTTPException(status_code=400, detail="company_name is required for employees")
+        if not payload.city or not payload.city.strip():
+            raise HTTPException(status_code=400, detail="city is required for employees")
+        if not payload.designation or not payload.designation.strip():
+            raise HTTPException(status_code=400, detail="designation is required for employees")
 
         company = db.query(Company).filter(Company.name == company_name).first()
         if company is None:
@@ -198,6 +204,8 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> dict:
         email=payload.email,
         password=hash_password(payload.password),
         role=role,
+        city=payload.city.strip() if payload.city else None,
+        designation=payload.designation.strip() if payload.designation else None,
         company_id=company.id if company else None,
     )
     db.add(user)
@@ -210,6 +218,8 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> dict:
             "id": user.id,
             "email": user.email,
             "role": user.role,
+            "city": user.city,
+            "designation": user.designation,
             "company_id": user.company_id,
             "company_name": company.name if company else None,
         },
@@ -238,6 +248,8 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict:
             "id": user.id,
             "email": user.email,
             "role": user.role,
+            "city": user.city,
+            "designation": user.designation,
             "company_id": user.company_id,
         },
     }
@@ -320,6 +332,41 @@ def search_policy_chunks(
         },
         "count": len(relevant_chunks),
         "chunks": relevant_chunks,
+    }
+
+
+@app.get("/claims")
+def list_company_claims(
+    current_user: User = Depends(require_auditor),
+    db: Session = Depends(get_db),
+) -> dict:
+    if current_user.company_id is None:
+        raise HTTPException(status_code=400, detail="Auditor is not linked to a company")
+
+    claims = (
+        db.query(Claim)
+        .filter(Claim.company_id == current_user.company_id)
+        .order_by(Claim.created_at.desc())
+        .all()
+    )
+
+    return {
+        "company_id": current_user.company_id,
+        "count": len(claims),
+        "claims": [
+            {
+                "id": claim.id,
+                "user_id": claim.user_id,
+                "company_id": claim.company_id,
+                "amount": claim.amount,
+                "status": claim.status,
+                "reason": claim.reason,
+                "receipt_path": claim.receipt_path,
+                "justification": claim.justification,
+                "created_at": claim.created_at,
+            }
+            for claim in claims
+        ],
     }
 
 
@@ -411,11 +458,48 @@ def submit_claim(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    receipt_details = extract_receipt_details(extracted_text)
+    latest_policy = (
+        db.query(Policy)
+        .filter(Policy.company_id == current_user.company_id)
+        .order_by(Policy.id.desc())
+        .first()
+    )
+    if latest_policy is None:
+        raise HTTPException(status_code=404, detail="No policy found for employee company")
+
+    try:
+        policy_text = extract_text_from_pdf(Path(latest_policy.file_path)).strip()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    auditor_prompt = build_auditor_prompt(
+        receipt_data=receipt_details,
+        justification=justification,
+        policy_text=policy_text,
+        city=current_user.city or "Unknown",
+        role=current_user.designation or current_user.role,
+    )
+
+    try:
+        llm_response = query_llama3(auditor_prompt)
+    except Exception as exc:
+        logger.warning("Failed to query llama3 for claim file=%s: %s", safe_name, exc)
+        llm_response = f"LLM call failed: {exc}"
+
+    llm_decision = extract_llm_json(llm_response)
+    claim_status = llm_decision["status"] if llm_decision["status"] in {"Approved", "Flagged", "Rejected"} else "Flagged"
+    claim_reason = llm_decision["reason"] or "Unable to determine decision from AI response"
+    total_value = parse_amount(receipt_details.get("total_amount"))
+
     claim = Claim(
         user_id=current_user.id,
         company_id=current_user.company_id,
-        status="Pending",
-        reason="Pending review",
+        amount=int(total_value) if total_value is not None else None,
+        status=claim_status,
+        reason=claim_reason,
         receipt_path=str(file_path),
         justification=justification,
     )
@@ -429,10 +513,14 @@ def submit_claim(
             "id": claim.id,
             "user_id": claim.user_id,
             "company_id": claim.company_id,
+            "amount": claim.amount,
             "status": claim.status,
+            "reason": claim.reason,
             "justification": claim.justification,
             "receipt_path": claim.receipt_path,
             "extracted_text": extracted_text,
+            "policy_path": latest_policy.file_path,
+            "llm_decision": llm_decision,
             "created_at": claim.created_at,
         },
     }

@@ -13,6 +13,8 @@ class User(Base):
     email = Column(String, unique=True)
     password = Column(String)
     role = Column(String)
+    city = Column(String)
+    designation = Column(String)
     company_id = Column(Integer, ForeignKey("companies.id"))
 
     company = relationship("Company", back_populates="users")
